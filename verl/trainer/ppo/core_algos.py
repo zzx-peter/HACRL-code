@@ -1101,6 +1101,33 @@ def compute_policy_loss_mapo_clip(
         aux_clipfrac_lower = verl_F.masked_mean(torch.gt(aux_seq_importance_ratio_clip, aux_seq_importance_ratio).float(), aux_response_mask)
         aux_clipfrac_higher = verl_F.masked_mean(torch.lt(aux_seq_importance_ratio_clip, aux_seq_importance_ratio).float(), aux_response_mask)
         pg_losses[aux_mask] = -aux_advantages * aux_seq_importance_ratio_clip * aux_performance_values.unsqueeze(-1) *(aux_seq_importance_ratio_clip.detach() ** config.alpha)
+        # ### 在这里我们记录aux_seq_importance_ratio_clip和正确率的差异
+        # ### 记录在"f{metrics_prefix}_{batch_idx}_hacpo_effiveness.txt中"
+        # ### 记录格式为: 记录aux_advantages > 0的样本的个数和aux_seq_importance_ratio的均值；aux_advantages < 0的样本的个数和aux_seq_importance_ratio的均值
+        # pos_mask = aux_advantages > 0
+        # neg_mask = aux_advantages < 0
+
+        # pos_count = int(pos_mask.sum().item())
+        # neg_count = int(neg_mask.sum().item())
+
+        # if pos_count > 0:
+        #     pos_ratio_mean = aux_seq_importance_ratio[pos_mask].mean().item()
+        # else:
+        #     pos_ratio_mean = float("nan")
+
+        # if neg_count > 0:
+        #     neg_ratio_mean = aux_seq_importance_ratio[neg_mask].mean().item()
+        # else:
+        #     neg_ratio_mean = float("nan")
+
+        # with open(f"{metrics_prefix}_hacpo_effiveness.txt", "a") as f:
+        #     f.write(
+        #         f"batch_idx={batch_idx}, "
+        #         f"aux_adv>0 count={pos_count}, aux_seq_importance_ratio_mean={pos_ratio_mean:.6f}; "
+        #         f"aux_adv<0 count={neg_count}, aux_seq_importance_ratio_mean={neg_ratio_mean:.6f}\n"
+        #     )
+
+
     # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
 
@@ -1125,7 +1152,6 @@ def compute_policy_loss_mapo_clip(
     else:
         aux_ppo_kl_scalar = None
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, main_ppo_kl_scalar, aux_ppo_kl_scalar, aux_clipfrac_lower, aux_clipfrac_higher
-
 
 @register_policy_loss("gspo")
 def compute_policy_loss_gspo(

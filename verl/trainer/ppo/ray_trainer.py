@@ -323,17 +323,37 @@ def swap(batch: DataProto, mask: Optional[torch.Tensor] = None) -> DataProto:
     tmp_attention_mask = batch.batch["attention_mask"][indices]
     tmp_position_ids = batch.batch["position_ids"][indices]
     
-    batch.batch["input_ids"][indices] = batch.batch["aux_input_ids"][indices]
-    batch.batch["responses"][indices] = batch.batch["aux_responses"][indices]
-    batch.batch["response_mask"][indices] = batch.batch["aux_response_mask"][indices]
-    batch.batch["attention_mask"][indices] = batch.batch["aux_attention_mask"][indices]
-    batch.batch["position_ids"][indices] = batch.batch["aux_position_ids"][indices]
+    batch.batch["input_ids"][indices] = batch.batch["aux_input_ids"][indices].to(
+        dtype=batch.batch["input_ids"].dtype, device=batch.batch["input_ids"].device
+    )
+    batch.batch["responses"][indices] = batch.batch["aux_responses"][indices].to(
+        dtype=batch.batch["responses"].dtype, device=batch.batch["responses"].device
+    )
+    batch.batch["response_mask"][indices] = batch.batch["aux_response_mask"][indices].to(
+        dtype=batch.batch["response_mask"].dtype, device=batch.batch["response_mask"].device
+    )
+    batch.batch["attention_mask"][indices] = batch.batch["aux_attention_mask"][indices].to(
+        dtype=batch.batch["attention_mask"].dtype, device=batch.batch["attention_mask"].device
+    )
+    batch.batch["position_ids"][indices] = batch.batch["aux_position_ids"][indices].to(
+        dtype=batch.batch["position_ids"].dtype, device=batch.batch["position_ids"].device
+    )
     
-    batch.batch["aux_input_ids"][indices] = tmp_input_ids
-    batch.batch["aux_responses"][indices] = tmp_responses
-    batch.batch["aux_response_mask"][indices] = tmp_response_mask
-    batch.batch["aux_attention_mask"][indices] = tmp_attention_mask
-    batch.batch["aux_position_ids"][indices] = tmp_position_ids
+    batch.batch["aux_input_ids"][indices] = tmp_input_ids.to(
+        dtype=batch.batch["aux_input_ids"].dtype, device=batch.batch["aux_input_ids"].device
+    )
+    batch.batch["aux_responses"][indices] = tmp_responses.to(
+        dtype=batch.batch["aux_responses"].dtype, device=batch.batch["aux_responses"].device
+    )
+    batch.batch["aux_response_mask"][indices] = tmp_response_mask.to(
+        dtype=batch.batch["aux_response_mask"].dtype, device=batch.batch["aux_response_mask"].device
+    )
+    batch.batch["aux_attention_mask"][indices] = tmp_attention_mask.to(
+        dtype=batch.batch["aux_attention_mask"].dtype, device=batch.batch["aux_attention_mask"].device
+    )
+    batch.batch["aux_position_ids"][indices] = tmp_position_ids.to(
+        dtype=batch.batch["aux_position_ids"].dtype, device=batch.batch["aux_position_ids"].device
+    )
     
     return batch
 
@@ -1660,8 +1680,35 @@ class RayPPOTrainer:
                             aux_mask = batch.batch["model_source"] == 1
                             scores_per_seq = batch.batch["token_level_scores"].detach().sum(-1)  # (bs,)
                             # compute the accuracy of main_model and aux_model, sum of rewards > 0.0 divided by number of problems
-                            main_model_accuracy = torch.sum(scores_per_seq[main_mask][scores_per_seq[main_mask] > 0.0]) / scores_per_seq[main_mask].numel()
-                            aux_model_accuracy  = torch.sum(scores_per_seq[aux_mask][scores_per_seq[aux_mask] > 0.0]) / scores_per_seq[aux_mask].numel()
+                            all_main_model_accuracy = torch.sum(scores_per_seq[main_mask][scores_per_seq[main_mask] > 0.0]) / scores_per_seq[main_mask].numel()
+                            all_aux_model_accuracy  = torch.sum(scores_per_seq[aux_mask][scores_per_seq[aux_mask] > 0.0]) / scores_per_seq[aux_mask].numel()
+                            # 每个题目回进行32次回答，同一题目的所有回答会共用一个 uid（与 MAPO 的 index 一致）
+                            # 只统计每个 prompt 下前 8 条 response；遍历顺序与 compute_mapo_outcome_advantage 相同：for i in range(bsz)
+                            index = batch.non_tensor_batch["uid"]
+                            model_source = batch.batch["model_source"]
+                            bsz = scores_per_seq.shape[0]
+                            k_first = 8
+                            main_keep = []
+                            aux_keep = []
+                            main_cnt = {}
+                            aux_cnt = {}
+                            for i in range(bsz):
+                                idx = index[i]
+                                if model_source[i] == 0:
+                                    c = main_cnt.get(idx, 0)
+                                    if c < k_first:
+                                        main_keep.append(i)
+                                    main_cnt[idx] = c + 1
+                                elif model_source[i] == 1:
+                                    c = aux_cnt.get(idx, 0)
+                                    if c < k_first:
+                                        aux_keep.append(i)
+                                    aux_cnt[idx] = c + 1
+
+                            main_idx = torch.tensor(main_keep, device=scores_per_seq.device, dtype=torch.long)
+                            aux_idx = torch.tensor(aux_keep, device=scores_per_seq.device, dtype=torch.long)
+                            main_model_accuracy = (scores_per_seq[main_idx] > 0.0).float().mean()
+                            aux_model_accuracy = (scores_per_seq[aux_idx] > 0.0).float().mean()
                             print(f"Main model accuracy: {main_model_accuracy}, Aux model accuracy: {aux_model_accuracy}")
                             
                             # Store accuracy values in history
@@ -1683,12 +1730,18 @@ class RayPPOTrainer:
                             aux_model_performance = 1e-8 if aux_model_performance < 1e-8 else aux_model_performance    
                             # print(f"Main model performance: {main_model_performance}, Aux model performance: {aux_model_performance}")
 
-                            # compute the ratio of main_model_performance and aux_model_performance
+                            # # compute the ratio of main_model_performance and aux_model_performance
                             performance_ratio = aux_model_performance / main_model_performance
                             if performance_ratio > 10.0:
                                 performance_ratio = 10.0
                             elif performance_ratio < 0.1:
                                 performance_ratio = 0.1
+
+                            ## record the true ratio and the performance ratio in "performance.txt", and bias=| true_ratio - performance_ratio | / true_ratio
+                            with open("new_performance.txt", "a") as f:
+                                true_ratio = all_aux_model_accuracy.item()/(all_main_model_accuracy.item()+1e-8)
+                                f.write(f"Global steps: {self.global_steps}, True ratio: {true_ratio}, Performance ratio: {performance_ratio}, bias: {abs(true_ratio - performance_ratio) / (true_ratio+1e-8)}\n")
+
                             if self.global_steps < self.stable_perf:
                                 print(f"Global steps < stable perf, set performance ratio to 1.0")
                                 performance_ratio = 1.0

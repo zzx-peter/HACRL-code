@@ -530,7 +530,7 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
                     
                     # as for now, only vanilla loss mode support model_source
-                    if loss_mode == "mapo_clip":
+                    if loss_mode == "mapo_clip" or loss_mode == "mapo_only_use_other_rollout":
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, main_ppo_kl_scalar, aux_ppo_kl_scalar, aux_clipfrac_lower, aux_clipfrac_higher = policy_loss_fn(
                             batch_idx=batch_idx,
                             old_log_prob=old_log_prob,

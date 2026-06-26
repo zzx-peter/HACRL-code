@@ -59,6 +59,12 @@ def default_compute_score(
         from . import math_dapo
 
         res = math_dapo.compute_score(solution_str, ground_truth)
+    
+    elif data_source == "tooluse":
+        from . import tooluse
+
+        res = tooluse.compute_score(solution_str, ground_truth)
+        
     elif data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",
@@ -70,7 +76,7 @@ def default_compute_score(
         from . import prime_math
 
         res = prime_math.compute_score(solution_str, ground_truth)
-    elif data_source in ["codecontests", "apps", "codeforces", "taco"]:
+    elif data_source in ["livecodebench","codecontests", "apps", "codeforces", "taco"]:
         # Use the passed sandbox_fusion_url if available
         if sandbox_fusion_url:
             from . import sandbox_fusion
