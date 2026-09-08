@@ -11,55 +11,64 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
-"""
-
+import logging
 import os
-import socket
+from pprint import pprint
 
 import hydra
 import ray
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
-from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
-from verl.utils.device import is_cuda_available
-from verl.utils.import_utils import load_extern_type
+from verl.utils.device import auto_set_device, is_cuda_available
+from verl.utils.import_utils import load_class_from_fqn
+from verl.utils.logging_utils import configure_verl_logging
 
-
-@hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
-def main(config):
-    """Main entry point for PPO training with Hydra configuration management.
-
-    Args:
-        config_dict: Hydra configuration dictionary containing training parameters.
-    """
-    run_ppo(config)
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 # Define a function to run the PPO-like training process
-def run_ppo(config) -> None:
+def run_ppo(config, task_runner_class) -> None:
     """Initialize Ray cluster and run distributed PPO training process.
 
     Args:
         config: Training configuration object containing all necessary parameters
                 for distributed PPO training including Ray initialization settings,
                 model paths, and training hyperparameters.
+        task_runner_class: For recipe to change TaskRunner.
     """
+    # Propagate determinism env vars from config before ray.init() so
+    # get_ppo_ray_runtime_env() forwards them to all Ray actors.
+    rollout_cfg = config.actor_rollout_ref.rollout
+    rm_rollout_cfg = config.reward.reward_model.rollout
+    if rollout_cfg.full_determinism or (config.reward.reward_model.enable and rm_rollout_cfg.full_determinism):
+        os.environ["VERL_FULL_DETERMINISM"] = "1"
+        os.environ["VLLM_BATCH_INVARIANT"] = "1"
+        os.environ["PYTHONHASHSEED"] = str(rollout_cfg.seed)
+
+    trainer_logger = config.trainer.get("logger", [])
+    if "rl_insight" in ([trainer_logger] if isinstance(trainer_logger, str) else trainer_logger or []):
+        os.environ["VERL_RL_INSIGHT_ENABLE"] = "1"
+
     # Check if Ray is not initialized
     if not ray.is_initialized():
         # Initialize Ray with a local cluster configuration
         # Set environment variables in the runtime environment to control tokenizer parallelism,
         # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
         # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
-        default_runtime_env = get_ppo_ray_runtime_env()
+        default_runtime_env = get_ppo_ray_runtime_env(config)
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
+
+        if config.transfer_queue.enable:
+            # Add runtime environment variables for transfer queue
+            runtime_env_vars = runtime_env_kwargs.get("env_vars", {})
+            runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
+            runtime_env_kwargs["env_vars"] = runtime_env_vars
+
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")
@@ -79,9 +88,9 @@ def run_ppo(config) -> None:
         nsight_options = OmegaConf.to_container(
             config.global_profiler.global_tool_config.nsys.controller_nsight_options
         )
-        runner = TaskRunner.options(runtime_env={"nsight": nsight_options}).remote()
+        runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
     else:
-        runner = TaskRunner.remote()
+        runner = task_runner_class.remote()
     ray.get(runner.run.remote(config))
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
@@ -91,336 +100,97 @@ def run_ppo(config) -> None:
         ray.timeline(filename=timeline_json_file)
 
 
-@ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
-class TaskRunner:
-    """Ray remote class for executing distributed PPO training tasks.
-
-    This class encapsulates the main training logic and runs as a Ray remote actor
-    to enable distributed execution across multiple nodes and GPUs.
-
-    Attributes:
-        role_worker_mapping: Dictionary mapping Role enums to Ray remote worker classes
-        mapping: Dictionary mapping Role enums to resource pool IDs for GPU allocation
-    """
+@ray.remote
+class TaskRunnerV1:
+    """V1 TaskRunner for PPO training."""
 
     def __init__(self):
-        self.role_worker_mapping = {}
-        self.mapping = {}
+        self.config = None
+        self.trainer = None
+        self.agent_loop_manager = None
 
-    def add_actor_rollout_worker(self, config):
-        """Add actor rollout worker based on the actor strategy."""
-        from verl.single_controller.ray import RayWorkerGroup
+    def init_agent_loop_manager(self):
+        """Initialize the agent loop manager to generate sequences.
 
-        if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
+        NOTE: User can customize their own agent loop manager, the only requirement is:
+        1. implement `generate_sequences` method
+        2. put agent loop outputs into TransferQueue
+        """
+        from verl.trainer.ppo.v1 import AgentLoopManagerTQ
 
-            actor_rollout_cls = (
-                AsyncActorRolloutRefWorker
-                if config.actor_rollout_ref.rollout.mode == "async"
-                else ActorRolloutRefWorker
-            )
-            ray_worker_group_cls = RayWorkerGroup
-
-        elif config.actor_rollout_ref.actor.strategy == "megatron":
-            from verl.workers.megatron_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
-
-            actor_rollout_cls = (
-                AsyncActorRolloutRefWorker
-                if config.actor_rollout_ref.rollout.mode == "async"
-                else ActorRolloutRefWorker
-            )
-            ray_worker_group_cls = RayWorkerGroup
-
+        manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
+        if manager_class_fqn:
+            agent_loop_manager_cls = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
         else:
-            raise NotImplementedError
+            agent_loop_manager_cls = AgentLoopManagerTQ
 
-        from verl.trainer.ppo.ray_trainer import Role
+        self.agent_loop_manager = agent_loop_manager_cls.create(
+            config=self.config,
+            llm_client=self.trainer.get_llm_client(),
+            teacher_client=self.trainer.get_teacher_client(),
+            reward_loop_worker_handles=self.trainer.get_reward_handles(),
+        )
 
-        self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
+    def run(self, config: DictConfig):
+        """Run the PPO training process."""
+        configure_verl_logging()
 
-        return actor_rollout_cls, ray_worker_group_cls
-    
-    def add_aux_model_worker(self, config, aux_policy_cls):
-        """Add auxiliary rollout worker if aux_model is enabled.
-        aux_model can be seen as a actor
-        Args:
-            config: Training configuration
-            aux_policy_cls: Worker class (same as actor/ref, e.g., FSDPWorker)
-        """
-        from verl.trainer.ppo.ray_trainer import Role
+        import transfer_queue as tq
 
-        # Aux model is optional; enable it explicitly via config.aux_model.enable
-        if config.aux_model.enable:
-            # Validate aux model configuration
-            if not config.aux_model.model.path:
-                raise ValueError("aux_model.model.path must be specified when aux_model.enable=True")
-            
-            # Follow VERL standard pattern: same worker class, same resource pool
-            self.role_worker_mapping[Role.AuxModel] = ray.remote(aux_policy_cls)
+        from verl.trainer.ppo.v1 import get_trainer_cls
 
-    def add_critic_worker(self, config):
-        """Add critic worker to role mapping."""
-        if config.critic.strategy in {"fsdp", "fsdp2"}:
-            use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-            if use_legacy_worker_impl in ["auto", "enable"]:
-                from verl.workers.fsdp_workers import CriticWorker
-            elif use_legacy_worker_impl == "disable":
-                from verl.workers.roles import CriticWorker
+        trainer_cls = get_trainer_cls(config.trainer.v1.trainer_mode)
 
-                print("Using new worker implementation")
-            else:
-                raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
-
-        elif config.critic.strategy == "megatron":
-            from verl.workers.megatron_workers import CriticWorker
-
-        else:
-            raise NotImplementedError
-
-        from verl.trainer.ppo.ray_trainer import Role
-
-        self.role_worker_mapping[Role.Critic] = ray.remote(CriticWorker)
-
-    def init_resource_pool_mgr(self, config):
-        """Initialize resource pool manager.
-        
-        VERL uses a single global resource pool for all models (actor, critic, ref, reward, aux).
-        This design allows efficient resource sharing and automatic VLLM instance management.
-        """
-        from verl.trainer.ppo.ray_trainer import Role
-
-        global_pool_id = "global_pool"
-        resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-        }
-        
-        # Map all roles to the same resource pool (VERL standard pattern)
-        self.mapping[Role.ActorRollout] = global_pool_id
-        self.mapping[Role.Critic] = global_pool_id
-        self.mapping[Role.AuxModel] = global_pool_id
-        # Note: RewardModel, RefPolicy, and AuxModel are mapped in their respective add_*_worker methods
-        from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-
-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
-        return resource_pool_manager
-
-    def add_reward_model_worker(self, config):
-        """Add reward model worker if enabled."""
-        from verl.trainer.ppo.ray_trainer import Role
-
-        if config.reward_model.enable:
-            if config.reward_model.strategy in {"fsdp", "fsdp2"}:
-                from verl.workers.fsdp_workers import RewardModelWorker
-            elif config.reward_model.strategy == "megatron":
-                from verl.workers.megatron_workers import RewardModelWorker
-            else:
-                raise NotImplementedError
-            self.role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
-            self.mapping[Role.RewardModel] = "global_pool"
-
-    def add_ref_policy_worker(self, config, ref_policy_cls):
-        """Add reference policy worker if KL loss or KL reward is used."""
-        from verl.trainer.ppo.ray_trainer import Role
-
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-            self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
-            self.mapping[Role.RefPolicy] = "global_pool"
-
-    def run(self, config):
-        """Execute the main PPO training workflow.
-
-        This method sets up the distributed training environment, initializes
-        workers, datasets, and reward functions, then starts the training process.
-
-        Args:
-            config: Training configuration object containing all parameters needed
-                   for setting up and running the PPO training process.
-        """
-        # Print the initial configuration. `resolve=True` will evaluate symbolic values.
-        from pprint import pprint
-
-        from omegaconf import OmegaConf
-
-        from verl.utils.fs import copy_to_local
-
-        print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
+        config.transfer_queue.enable = True
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+        self.config = config
 
-        actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
-        self.add_critic_worker(config)
-
-        # We should adopt a multi-source reward function here:
-        # - for rule-based rm, we directly call a reward score
-        # - for model-based rm, we call a model
-        # - for code related prompt, we send to a sandbox if there are test cases
-        # finally, we combine all the rewards together
-        # The reward type depends on the tag of the data
-        self.add_reward_model_worker(config)
-
-        # Add a reference policy worker if KL loss or KL reward is used.
-        self.add_ref_policy_worker(config, actor_rollout_cls)
-        
-        # NEW: Add auxiliary model if enabled
-        self.add_aux_model_worker(config, actor_rollout_cls)
-
-        # validate config
-        validate_config(
-            config=config,
-            use_reference_policy=need_reference_policy(self.role_worker_mapping),
-            use_critic=need_critic(config),
-        )
-
-        # Download the checkpoint from HDFS to the local machine.
-        # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
-        local_path = copy_to_local(
-            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
-        )
-
-        aux_local_path = copy_to_local(
-            config.aux_model.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
-        )
-
-        # Instantiate the tokenizer and processor.
-        from verl.utils import hf_processor, hf_tokenizer
-
-        trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        aux_tokenizer = hf_tokenizer(aux_local_path, trust_remote_code=trust_remote_code)
-        # Used for multimodal LLM, could be None
-        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
-
-        # Load the reward manager for training and validation.
-        reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
-        )
-        val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
-        )
-
-        resource_pool_manager = self.init_resource_pool_mgr(config)
-
-        from verl.utils.dataset.rl_dataset import collate_fn
-
-        # Create training and validation datasets.
-        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True, aux_tokenizer=aux_tokenizer if aux_tokenizer is not None else None)
-        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False, aux_tokenizer=aux_tokenizer if aux_tokenizer is not None else None)
-        train_sampler = create_rl_sampler(config.data, train_dataset)
-
-        # Initialize the PPO trainer.
-        trainer = RayPPOTrainer(
-            config=config,
-            tokenizer=tokenizer,
-            processor=processor,
-            role_worker_mapping=self.role_worker_mapping,
-            resource_pool_manager=resource_pool_manager,
-            ray_worker_group_cls=ray_worker_group_cls,
-            reward_fn=reward_fn,
-            val_reward_fn=val_reward_fn,
-            train_dataset=train_dataset,
-            val_dataset=val_dataset,
-            collate_fn=collate_fn,
-            train_sampler=train_sampler,
-            aux_tokenizer=aux_tokenizer,
-        )
-        # Initialize the workers of the trainer.
-        trainer.init_workers()
-        # Start the training process.
-        trainer.fit()
+        # initialize transfer queue
+        tq.init(config.transfer_queue)
+        succeeded = False
+        try:
+            self.trainer = trainer_cls(config=config)
+            self.trainer.init()
+            self.init_agent_loop_manager()
+            self.trainer.fit(self.agent_loop_manager)
+            succeeded = True
+        finally:
+            try:
+                tracking = getattr(self.trainer, "logger", None)
+                if tracking is not None:
+                    tracking.finish(exit_code=0 if succeeded else 1)
+            finally:
+                tq.close()
 
 
-def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, aux_tokenizer=None):
-    """Create a dataset.
+@hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
+def main(config):
+    """Main entry point for PPO training with Hydra configuration management.
 
-    Arguments:
-        data_paths: List of paths to data files.
-        data_config: The data config.
-        tokenizer (Tokenizer): The tokenizer.
-        processor (Processor): The processor.
-        aux_tokenizer (Tokenizer, optional): Auxiliary tokenizer for dual-tokenizer support.
-
-    Returns:
-        dataset (Dataset): The dataset.
+    Args:
+        config: Hydra configuration dictionary containing training parameters.
     """
-    from torch.utils.data import Dataset
+    # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
+    auto_set_device(config)
 
-    from verl.utils.dataset.rl_dataset import RLHFDataset
-
-    # Check if a custom dataset class is specified in the data configuration
-    # and if the path to the custom class is provided
-    if "custom_cls" in data_config and data_config.custom_cls.get("path", None) is not None:
-        # Dynamically load the custom dataset class
-        dataset_cls = load_extern_type(data_config.custom_cls.path, data_config.custom_cls.name)
-        # Verify that the custom dataset class inherits from torch.utils.data.Dataset
-        if not issubclass(dataset_cls, Dataset):
-            raise TypeError(
-                f"The custom dataset class '{data_config.custom_cls.name}' from "
-                f"'{data_config.custom_cls.path}' must inherit from torch.utils.data.Dataset"
-            )
-    elif "datagen" in data_config and data_config.datagen.get("path", None) is not None and is_train:
-        # If a data generation strategy is specified, use the DynamicGenDataset class
-        from verl.utils.dataset.dynamicgen_dataset import DynamicGenDataset
-
-        dataset_cls = DynamicGenDataset
-        print("Using DynamicGenDataset for data generation.")
-
-    else:
-        # Use the default RLHFDataset class if no custom class is specified
-        dataset_cls = RLHFDataset
-    print(f"Using dataset class: {dataset_cls.__name__}")
-
-    # Instantiate the dataset using the determined dataset class
-    dataset = dataset_cls(
-        data_files=data_paths,
-        tokenizer=tokenizer,
-        processor=processor,
-        aux_tokenizer=aux_tokenizer,
-        config=data_config,
+    # validate config
+    validate_config(
+        config=config,
+        use_reference_policy=need_reference_policy(config),
+        use_critic=need_critic(config),
     )
 
-    return dataset
-
-
-def create_rl_sampler(data_config, dataset):
-    """Create a sampler for the dataset.
-
-    Arguments:
-        data_config: The data config.
-        dataset (Dataset): The dataset.
-
-    Returns:
-        sampler (Sampler): The sampler.
-    """
-    import torch
-    from torch.utils.data import RandomSampler, SequentialSampler
-
-    if data_config.sampler is not None and data_config.sampler.get("class_path", None) is not None:
-        curriculum_class = load_extern_type(
-            data_config.sampler.class_path,
-            data_config.sampler.class_name,
-        )
-        sampler = curriculum_class(
-            data_source=dataset,
-            data_config=data_config,
-        )
-        assert isinstance(sampler, AbstractSampler)
-        assert data_config.get("dataloader_num_workers", 8) == 0, (
-            "If using curriculum, num_workers must be 0 to prevent data caching. "
-            "If the dataloader caches data before the batch is done the "
-            "curriculum sampler won't have the opportunity to reorder it. "
-        )
-
-    # Use a sampler to facilitate checkpoint resumption.
-    # If shuffling is enabled in the data configuration, create a random sampler.
-    elif data_config.shuffle:
-        train_dataloader_generator = torch.Generator()
-        train_dataloader_generator.manual_seed(data_config.get("seed", 1))
-        sampler = RandomSampler(data_source=dataset, generator=train_dataloader_generator)
+    if config.trainer.use_v1:
+        run_ppo(config, task_runner_class=TaskRunnerV1)
     else:
-        # If shuffling is disabled, use a sequential sampler to iterate through the dataset in order.
-        sampler = SequentialSampler(data_source=dataset)
+        from verl.trainer.main_ppo_v0 import TaskRunner
 
-    return sampler
+        logger.warning(
+            "Legacy trainer `main_ppo_v0.py` is deprecated, and wil be removed in v0.9.0."
+            "Please set `trainer.use_v1=True` in config to use V1 trainer."
+        )
+        run_ppo(config, task_runner_class=TaskRunner)
 
 
 if __name__ == "__main__":

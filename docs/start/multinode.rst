@@ -1,7 +1,7 @@
 Multinode Training
 ==================
 
-Last updated: 06/10/2025.
+Last updated: 07/29/2026.
 
 .. _wuxibin89: https://github.com/wuxibin89
 
@@ -69,6 +69,18 @@ Submit job to ray cluster
 Option 2: Launch via SkyPilot on Kubernetes or clouds
 ------------------------------------------------------
 
+.. note::
+   Ready-to-use SkyPilot example configurations are available in the `examples/tutorial/skypilot/ <https://github.com/verl-project/verl/tree/main/examples/tutorial/skypilot>`_ directory:
+   
+   - ``verl-ppo.yaml`` - PPO training with GSM8K dataset
+   - ``verl-grpo.yaml`` - GRPO training with MATH dataset
+
+   Agent Loop and tool-use training is covered by the `Agent Loop tutorial
+   <https://github.com/verl-project/verl/blob/main/examples/tutorial/agent_loop_get_started/agent_loop_tutorial.ipynb>`_.
+   It does not currently include a preconfigured SkyPilot task.
+   
+   See the `SkyPilot examples README <https://github.com/verl-project/verl/tree/main/examples/tutorial/skypilot>`_ for detailed usage instructions.
+
 Step 1: Setup SkyPilot
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 SkyPilot can support different clouds, here we use GCP as example. `install skypilot <https://docs.skypilot.co/en/latest/getting-started/installation.html>`_
@@ -96,9 +108,9 @@ Step 2: Prepare dataset
 
 .. code-block:: bash
 
-   git clone https://github.com/volcengine/verl.git
+   git clone https://github.com/verl-project/verl.git
    cd examples/data_preprocess
-   python3 gsm8k.py --local_dir ~/data/gsm8k
+   python3 gsm8k.py --local_save_dir ~/data/gsm8k
 
 
 Step 3: Submit a job with SkyPilot
@@ -138,7 +150,7 @@ Step 3: Submit a job with SkyPilot
    # Commands run on each node of the remote cluster to set up the environment (e.g., install dependencies). These are run directly inside Docker.
    setup: |
      rm -rf verl
-     git clone https://github.com/volcengine/verl.git
+     git clone https://github.com/verl-project/verl.git
      cd verl
      pip3 install -v -e .[vllm]
 
@@ -279,7 +291,23 @@ manager available on your cluster or use other container runtimes (e.g. through 
 
 2. Follow :doc:`GSM8K example<../examples/gsm8k_example>` to prepare the dataset and model checkpoints.
 
-3. Modify `examples/slurm/ray_on_slurm.slurm <https://github.com/volcengine/verl/blob/main/examples/slurm/ray_on_slurm.slurm>`_ with your cluster's own information.
+3. Modify `examples/tutorial/slurm/ray_on_slurm.slurm <https://github.com/verl-project/verl/blob/main/examples/tutorial/slurm/ray_on_slurm.slurm>`_ with your cluster's own information.
+
+   On a cluster with multiple network interfaces, hostname resolution may select a management network instead of the
+   high-speed interconnect. Set ``RAY_NETWORK_INTERFACE`` to make the example resolve the IPv4 address of that interface
+   on every node and explicitly bind both the Ray head and workers to it:
+
+   .. code:: bash
+
+       RAY_NETWORK_INTERFACE=ib0 sbatch examples/tutorial/slurm/ray_on_slurm.slurm
+
+   The interface name must exist on every allocated node. This setting controls Ray's network interface only. Distributed
+   communication backends may need their own interface settings, for example:
+
+   .. code:: bash
+
+       export GLOO_SOCKET_IFNAME=ib0
+       export NCCL_SOCKET_IFNAME=ib0
 
 4. Submit the job script to the Slurm cluster with `sbatch`.
 
@@ -325,15 +353,15 @@ Once the fleet is created, define a Ray cluster task, e.g. in ``ray-cluster.dsta
         - PYTHONUNBUFFERED=1
         - CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
     
-    image: whatcanyousee/verl:ngc-cu124-vllm0.8.5-sglang0.4.6-mcore0.12.0-te2.2
+    image: verlai/verl:app-verl0.6-transformers4.56.1-sglang0.5.2-mcore0.13.0-te2.2
     commands:
-        - git clone https://github.com/volcengine/verl
+        - git clone https://github.com/verl-project/verl
         - cd verl
         - pip install --no-deps -e .
         - pip install hf_transfer hf_xet
         - |
         if [ $DSTACK_NODE_RANK = 0 ]; then
-            python3 examples/data_preprocess/gsm8k.py --local_dir ~/data/gsm8k
+            python3 examples/data_preprocess/gsm8k.py --local_save_dir ~/data/gsm8k
             python3 -c "import transformers; transformers.pipeline('text-generation', model='Qwen/Qwen2.5-7B-Instruct')" 
             ray start --head --port=6379;
         else
@@ -732,7 +760,7 @@ slurm_script.sh
 
     echo "Starting data preprocessing..."
     docker exec "${CONTAINER_NAME}" \
-        python3 "examples/data_preprocess/gsm8k.py" "--local_dir" "../data/gsm8k"
+        python3 "examples/data_preprocess/gsm8k.py" "--local_save_dir" "../data/gsm8k"
 
     echo "Starting data preprocessing..."
     docker exec "${CONTAINER_NAME}" \
@@ -787,8 +815,8 @@ slurm_script.sh
         critic.model.path=$MODEL_PATH \
         critic.model.enable_gradient_checkpointing=False \
         critic.ppo_micro_batch_size_per_gpu=8 \
-        critic.model.fsdp_config.param_offload=False \
-        critic.model.fsdp_config.optimizer_offload=False \
+        critic.fsdp.param_offload=False \
+        critic.fsdp.optimizer_offload=False \
         algorithm.kl_ctrl.kl_coef=0.0001 \
         trainer.critic_warmup=0 \
         trainer.logger='["console","wandb"]' \
@@ -809,4 +837,3 @@ Just sbatch your slurm_script.sh
 .. code-block:: bash
 
     sbatch slurm_script.sh
-

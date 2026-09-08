@@ -11,7 +11,60 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .base import BaseEngine, EngineRegistry
-from .fsdp import FSDPEngine
+import warnings
 
-__all__ = ["BaseEngine", "EngineRegistry", "FSDPEngine"]
+from .base import BaseEngine, EngineRegistry
+from .fsdp import FSDPEngine, FSDPEngineWithLMHead
+
+__all__ = [
+    "BaseEngine",
+    "EngineRegistry",
+    "FSDPEngine",
+    "FSDPEngineWithLMHead",
+]
+
+try:
+    from .torchtitan import TorchTitanEngine, TorchTitanEngineWithLMHead
+
+    __all__ += ["TorchTitanEngine", "TorchTitanEngineWithLMHead"]
+except ImportError as e:
+    warnings.warn(f"torchtitan engine is not available: {e!r}", stacklevel=1)
+    TorchTitanEngine = None
+    TorchTitanEngineWithLMHead = None
+
+try:
+    from .veomni import VeOmniEngine, VeOmniEngineWithLMHead
+
+    __all__ += ["VeOmniEngine", "VeOmniEngineWithLMHead"]
+except ImportError as e:
+    warnings.warn(f"veomni engine is not available: {e!r}", stacklevel=1)
+    VeOmniEngine = None
+    VeOmniEngineWithLMHead = None
+
+try:
+    from .automodel import AutomodelEngine, AutomodelEngineWithLMHead
+
+    __all__ += ["AutomodelEngine", "AutomodelEngineWithLMHead"]
+except ImportError as e:
+    warnings.warn(f"automodel engine is not available: {e!r}", stacklevel=1)
+    AutomodelEngine = None
+    AutomodelEngineWithLMHead = None
+
+# Mindspeed must be imported before Megatron to ensure the related monkey patches take effect as expected
+try:
+    from .mindspeed import MindspeedEngineWithLMHead, MindspeedEngineWithValueHead
+
+    __all__ += ["MindspeedEngineWithLMHead", "MindspeedEngineWithValueHead"]
+except ImportError as e:
+    warnings.warn(f"mindspeed engine is not available: {e!r}", stacklevel=1)
+    MindspeedEngineWithLMHead = None
+    MindspeedEngineWithValueHead = None
+
+try:
+    from .megatron import MegatronEngine, MegatronEngineWithLMHead, MegatronEngineWithValueHead
+
+    __all__ += ["MegatronEngine", "MegatronEngineWithLMHead", "MegatronEngineWithValueHead"]
+except ImportError as e:
+    warnings.warn(f"megatron engine is not available: {e!r}", stacklevel=1)
+    MegatronEngine = None
+    MegatronEngineWithLMHead = None

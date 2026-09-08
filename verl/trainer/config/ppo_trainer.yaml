@@ -7,25 +7,43 @@
 # specify the default per-component configs
 defaults:
 
+  - model_engine: dp
+
   # <folder_name>@<field_name>.<field_name>: <yaml_file_name>
   # actor_rollout_ref.actor: trainer/config/actor/dp_actor.yaml
-  - actor@actor_rollout_ref.actor: dp_actor
+  - actor@actor_rollout_ref.actor: ${model_engine}_actor
 
   # data: trainer/config/data/legacy_data.yaml
   - data@data: legacy_data
 
   # Reference model config.
   # Reference model will be enabled when actor.use_kl_loss or/and algorithm.use_kl_in_reward is/are True.
-  - ref@actor_rollout_ref.ref: dp_ref
+  - ref@actor_rollout_ref.ref: ${model_engine}_ref
 
   # Rollout model config.
   - rollout@actor_rollout_ref.rollout: rollout
 
-  # Critic model config.
-  - critic@critic: dp_critic
+  # Model config.
+  - model@actor_rollout_ref.model: hf_model
 
-  # Reward model config.
-  - reward_model@reward_model: dp_reward_model
+  # Critic model config.
+  - critic@critic: ${model_engine}_critic
+  - model@critic.model: hf_model
+
+  # legacy reward impl config, for backward compatibility
+  - legacy_reward_impl
+
+  # Reward config.
+  - reward@reward: reward
+
+  # Rollout correction config.
+  - algorithm@algorithm.rollout_correction: rollout_correction
+
+  # distillation config
+  - distillation@distillation: distillation
+
+  # TransferQueue configuration.
+  - transfer_queue@transfer_queue: transfer_queue
 
   # load the reference default config, then apply the fields in the current yaml
   # self config override anything above
@@ -39,85 +57,6 @@ actor_rollout_ref:
 
   # Timeout for operations executed against the process group
   nccl_timeout: 600
-
-  # common configs for the model
-  model:
-
-    # Huggingface model path. This can be either local path or HDFS path.
-    path: ~/models/deepseek-llm-7b-chat
-
-    # Custom chat template for the model.
-    custom_chat_template: null
-
-    # Whether to use shared memory (SHM) for accelerating the loading of model weights
-    use_shm: false
-
-    # Additional Python packages to register huggingface models/tokenizers.
-    external_lib: null
-
-    # Used to override model's original configurations, mainly dropout
-    override_config: {}
-
-    # Enable gradient checkpointing for actor
-    enable_gradient_checkpointing: true
-
-    # Enable activation offloading for actor
-    enable_activation_offload: false
-
-    # Whether to remove padding tokens in inputs during training
-    use_remove_padding: false
-
-    # Set to positive value to enable LoRA (e.g., 32)
-    lora_rank: 0
-
-    # LoRA scaling factor
-    lora_alpha: 16
-
-    # Target modules to apply LoRA. Options: "all-linear" (not recommended for VLMs) or
-    # [q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]
-    target_modules: all-linear
-
-    # Exclude modules from applying Lora. Similar usage to target_modules and Peft.
-    # Example: '.*visual.*' for excluding the ViT in Qwen2.5-VL, as currently vllm does not support ViT Lora.
-    exclude_modules: null
-
-    # Whether to use Liger for linear layer fusion
-    use_liger: false
-
-    # Whether to use custom fused kernels (e.g., FlashAttention, fused MLP)
-    use_fused_kernels: false
-
-    # Options for fused kernels. If use_fused_kernels is true, this will be used.
-    fused_kernel_options:
-
-      # Implementation backend for fused kernels. Options: "triton" or "torch".
-      impl_backend: torch
-
-    # Whether to enable loading a remote code model
-    trust_remote_code: false
-
-  # Rollout model config.
-  rollout:
-
-    # may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
-    enable_chunked_prefill: True
-
-    # Which loader to use for rollout model weights: dummy_dtensor, hf, megatron, etc.
-    # safetensors (for huge model, and set use_shm=True); dummy_dtensor: randomly init model weight
-    load_format: dummy_dtensor
-
-    # for huge model, layered summon can save memory (prevent OOM) but make it slower
-    layered_summon: False
-
-# custom reward function definition
-custom_reward_function:
-
-  # The path to the file containing your customized reward function.
-  # If not specified, pre-implemented reward functions will be used.
-  path: null
-
-  # The name of the reward function within the specified file. Default is 'compute_score'.
-  name: compute_score
 
 # config for the algorithm
 algorithm:
@@ -136,6 +75,24 @@ algorithm:
 
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
+
+  # Group filtering configuration used by DAPO and entropy-based sampling
+  filter_groups:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.FilterGroupsConfig
+
+    # Whether to enable group filtering
+    enable: False
+
+    # Metric used to identify groups with uniform rewards, acc / score / seq_reward / seq_final_reward / ...
+    metric: null
+
+    # Maximum number of generation batches; non-positive values mean no upper limit
+    max_num_gen_batches: 0
+
+    # Maximum Sync DAPO prompt batches concurrently in flight, measured in train-batch units
+    max_inflight_gen_batches: 1
 
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
@@ -173,18 +130,11 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
-  # Auxiliary model weight for multi-model training
-  # When using aux_model, this weight is applied to auxiliary model samples
-  # during advantage computation. Higher values increase learning from aux samples.
-  # Different models use different baseline
-  model_source_baseline: false
-
-
 # config for the trainer
 trainer:
 
   # Whether to balance batch sizes across distributed workers
-  balance_batch: False
+  balance_batch: True
 
   # Number of epochs in training
   total_epochs: 30
@@ -199,7 +149,7 @@ trainer:
   experiment_name: gsm8k
 
   # Logging backends to use: "console", "wandb", etc.
-  logger: [ 'console', 'wandb' ]
+  logger: ["console", "wandb"]
 
   # Number of generations to log during validation
   log_val_generations: 0
@@ -262,18 +212,64 @@ trainer:
   # Maximum number of critic checkpoints to keep
   max_critic_ckpt_to_keep: null
 
-  # Maximum number of aux model checkpoints to keep
-  max_aux_ckpt_to_keep: null
-
   # Timeout (in seconds) for Ray worker to wait for registration
   ray_wait_register_center_timeout: 300
 
   # Device to run training on (e.g., "cuda", "cpu")
   device: cuda
 
-  # whether to use legacy worker implementation
-  #  mode: "auto", "enable", or "disable"
-  use_legacy_worker_impl: auto
+  # Whether to use V1 trainer
+  use_v1: true
+
+  # V1 trainer mode configs
+  v1:
+
+    # Trainer mode: "sync", "colocate_async", "separate_async"
+    trainer_mode: sync
+
+    # Synchronous PPO trainer
+    sync: {}
+
+    # Asynchronous PPO trainer with colocated trainer and rollout
+    colocate_async:
+
+      # Number of warmup batches to add before training loop starts
+      num_warmup_batches: 1
+
+    # Asynchronous PPO trainer with separate trainer and rollout
+    separate_async:
+
+      # Number of warmup batches to add before training loop starts
+      num_warmup_batches: 1
+
+      # Frequency of parameter synchronization between trainer and rollout
+      parameter_sync_step: 4
+
+    # Replay buffer sampling strategy
+    sampler:
+
+      # Maximum number of model versions that trajectory can span
+      max_off_policy_threshold: 8
+
+      # How to handle trajectory that exceeds the maximum number of model versions
+      # drop: drop the trajectory
+      # wait: dropless, wait all trajectories that reach threshold to finish
+      max_off_policy_strategy: drop
+
+      # Whether sync trainers replace failed groups that have no trajectories
+      sync_refill_failed_groups: False
+
+      # Custom sampler config
+      custom_sampler:
+
+        # Path to the custom sampler class
+        path: null
+
+        # Name of the custom sampler class
+        name: null
+
+      # Additional kwargs for the custom sampler
+      sampler_kwargs: {}
 
 # profiler configs
 global_profiler:
@@ -281,7 +277,7 @@ global_profiler:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.utils.profiler.ProfilerConfig
 
-  # Profiling tool: choose between nsys, npu, torch, torch_memory
+  # Profiling tool: choose between nsys, npu, torch, torch_memory, precision_debugger
   tool: null
 
   # profile steps
@@ -297,7 +293,7 @@ global_profiler:
 
   # Specific tool configs, can use +profiler.tool_config.[tool].xxx to config
   global_tool_config:
-  
+
     # nsys config
     nsys:
 
@@ -364,32 +360,86 @@ global_profiler:
 
       # devices, record_context etc.
       kw_args: {}
-  
+
+    # msprobe precision debugger
+    precision_debugger:
+
+      # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+      _target_: verl.utils.profiler.config.PrecisionDebuggerToolConfig
+
+      # Path to msprobe config json
+      config_path: null
+
+      # Deprecated and ignored. Use global_profiler.steps.
+      steps: null
+
+      # Profile stages
+      # Supported stages: actor_update, actor_compute_log_prob, ref_compute_log_prob,
+      # compute_values, critic_update, compute_rm_score
+      stages: null
+
+      # Whether to fail on unknown stage or missing msprobe
+      strict: False
+
+# configs for SkipManager
+skip:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.utils.skip.SkipManagerConfig
+
+  # configs for RolloutSkip 
+  rollout:
+
+    # Whether to enable RolloutSkip
+    enable: False
+
+    # Directory to save rollout data
+    dump_dir: "~/.verl/rollout_dump"
+
+    # Steps to skip rollout
+    steps: []
+
+  # Action to take when rollout is skipped, refer to verl.utils.skip.base_skip.SkipAction
+    action: cache
+
+  # configs for RolloutTqSkip (V1 TransferQueue-based trainer)
+  rollout_tq:
+
+    # Whether to enable RolloutTqSkip
+    enable: False
+
+    # Directory to save rollout data
+    dump_dir: "~/.verl/rollout_dump"
+
+    # Steps to skip rollout
+    steps: []
+
+    # Action to take when rollout is skipped (cache | repeat)
+    action: cache
+
+  # configs for AsyncRolloutSkip (fully async policy)
+  async_rollout:
+
+    # Whether to enable AsyncRolloutSkip
+    enable: False
+
+    # Directory to save rollout data
+    dump_dir: "~/.verl/rollout_dump"
+
+    # Steps to skip rollout (rollouter global_steps from sample_id)
+    steps: []
+
+    # Action to take when rollout is skipped, refer to verl.utils.skip.base_skip.SkipAction
+    action: cache
+
 # configs related to ray
 ray_kwargs:
 
   # configs related to ray initialization
   ray_init:
-  
+
     # Number of CPUs for Ray. Use a fixed number instead of null when using SLURM.
     num_cpus: null
 
   # Path to save Ray timeline JSON for performance profiling
   timeline_json_file: null
-
-aux_model:
-  enable: false
-  
-  # Auxiliary model configuration for multi-model training
-  # 
-  # The aux_model performs rollout sampling alongside the main model,
-  # but does NOT update its parameters. All sampled data from both models
-  # is used to train the main model, with different old_log_prob calculations.
-  #
-  # Architecture: aux_model shares the same resource pool as other models (ref, critic, reward)
-  # VLLM instances use sleep mode to avoid conflicts automatically.
-  model:
-    # Path to the auxiliary model (REQUIRED when enable=true)
-    # All other settings (GPU memory, sampling params, etc.) are inherited 
-    # from actor_rollout_ref configuration
-    path: ""

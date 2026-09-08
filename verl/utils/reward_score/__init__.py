@@ -24,6 +24,7 @@ def default_compute_score(
     sandbox_fusion_url=None,
     concurrent_semaphore=None,
     memory_limit_mb=None,
+    **kwargs,
 ):
     """Compute the score for a given solution based on the data source.
 
@@ -45,9 +46,9 @@ def default_compute_score(
 
         res = gsm8k.compute_score(solution_str, ground_truth)
     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
-        from . import math
+        from . import math_reward
 
-        res = math.compute_score(solution_str, ground_truth)
+        res = math_reward.compute_score(solution_str, ground_truth)
         # [Optional] Math-Verify Integration
         # For enhanced accuracy, consider utilizing Math-Verify (https://github.com/huggingface/Math-Verify).
         # Note: Math-Verify needs to be manually installed via pip: `pip install math-verify`.
@@ -55,16 +56,10 @@ def default_compute_score(
 
         # from . import math_verify
         # res = math_verify.compute_score(solution_str, ground_truth)
-    elif data_source == "math_dapo" or data_source.startswith("aime"):
+    elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
         from . import math_dapo
 
         res = math_dapo.compute_score(solution_str, ground_truth)
-    
-    elif data_source == "tooluse":
-        from . import tooluse
-
-        res = tooluse.compute_score(solution_str, ground_truth)
-        
     elif data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",
@@ -76,7 +71,7 @@ def default_compute_score(
         from . import prime_math
 
         res = prime_math.compute_score(solution_str, ground_truth)
-    elif data_source in ["livecodebench","codecontests", "apps", "codeforces", "taco"]:
+    elif data_source in ["codecontests", "apps", "codeforces", "taco"]:
         # Use the passed sandbox_fusion_url if available
         if sandbox_fusion_url:
             from . import sandbox_fusion
@@ -135,6 +130,11 @@ def _default_compute_score(
     return default_compute_score(
         data_source, solution_str, ground_truth, extra_info, sandbox_fusion_url, concurrent_semaphore, memory_limit_mb
     )
+
+
+def get_default_compute_score(reward_name: str | None):
+    """Get the default compute_score function based on the reward manager type."""
+    return default_compute_score
 
 
 __all__ = ["default_compute_score"]

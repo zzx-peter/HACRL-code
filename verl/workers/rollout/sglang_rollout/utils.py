@@ -21,6 +21,60 @@ import torch
 import torch.distributed as dist
 
 from verl.utils.device import get_device_name
+from verl.workers.rollout.utils import ensure_async_iterator
+
+SGLANG_LORA_NAME = "verl_actor_lora_name"
+
+
+def normalize_peft_config_for_sglang(peft_config: dict) -> dict:
+    """Normalize an engine's adapter config (enums to strings) for SGLang's adapter loader."""
+    normalized = dict(peft_config)
+    for key in ("task_type", "peft_type"):
+        if key in normalized:
+            normalized[key] = getattr(normalized[key], "value", normalized[key])
+    if "peft_type" not in normalized:
+        raise ValueError(
+            "adapter config has no 'peft_type', which SGLang's adapter loader requires. See "
+            "BaseEngine.get_per_tensor_param for the keys. Keys present: " + ", ".join(sorted(normalized))
+        )
+    # A bare string must stay one: list() would tear "all-linear" into characters.
+    target_modules = normalized["target_modules"]
+    normalized["target_modules"] = target_modules if isinstance(target_modules, str) else list(target_modules)
+    return normalized
+
+
+def lora_rank_of(model_config) -> int:
+    """The LoRA rank, from whichever block carries it: megatron sets ``model.lora.rank``, fsdp
+    the flat ``model.lora_rank``."""
+    return max(int(getattr(model_config, "lora_rank", 0) or 0), int(model_config.lora.get("rank", 0) or 0))
+
+
+def lora_served_as_adapter(model_config) -> bool:
+    """Whether SGLang should serve LoRA as a hot-swappable adapter.
+
+    ``HFModelConfig`` carries two LoRA config blocks that are never synced: megatron
+    runs set ``model.lora.rank`` (dict) while fsdp runs set the flat ``model.lora_rank``,
+    so both must be checked to detect that LoRA is enabled at all.
+
+    With ``model.lora.merge=True`` the trainer merges the adapter into the base weights
+    and pushes a full HF-keyed weight update (``peft_config=None``), so no adapter is ever
+    loaded into SGLang: the engine must not be launched with ``enable_lora`` and requests
+    must not carry a ``lora_path``.
+    """
+    lora_enabled = lora_rank_of(model_config) > 0
+    return lora_enabled and not model_config.lora.get("merge", False)
+
+
+def sglang_lora_target_modules(target_modules: Any) -> list[str]:
+    """Render verl's ``model.target_modules`` as SGLang's ``lora_target_modules``."""
+    if target_modules == "all-linear":
+        return ["all"]
+    if isinstance(target_modules, str):
+        raise ValueError(
+            f"SGLang cannot serve a regex `target_modules` ({target_modules!r}); PEFT matches it "
+            f"against the whole parameter key. Use `all-linear`, or list the module names."
+        )
+    return list(target_modules)
 
 
 def broadcast_pyobj(
@@ -68,7 +122,23 @@ def broadcast_pyobj(
         return data
 
 
-def get_named_tensor_buckets(
+def _compact_for_bucket(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a tensor safe to retain in a weight-sync bucket without pinning extra memory.
+
+    ``get_named_tensor_buckets`` keeps every tensor alive until its bucket is flushed. A tensor
+    that is a *view* into a larger backing buffer would therefore keep that whole buffer resident
+    (and ship the whole buffer downstream), so such views must be compacted with ``clone()``.
+
+    However the weights synced here come from ``DTensor.full_tensor()`` (a fresh all-gather) and
+    already own tight, contiguous storage. Cloning those allocates a second full-size buffer and
+    transiently doubles the tensor's footprint -- which OOMs on multi-GiB fused MoE weights
+    (e.g. ``[num_experts, ...]`` ``gate_up_proj``/``qkv``) while the actor params and rollout
+    weights are both already resident. Skip the clone when the tensor already owns its storage.
+    """
+    return tensor.clone() if tensor._base is not None else tensor
+
+
+async def get_named_tensor_buckets(
     iterable: Iterator[tuple[str, torch.Tensor]], bucket_bytes: int
 ) -> Iterator[list[tuple[str, torch.Tensor]]]:
     """
@@ -93,15 +163,15 @@ def get_named_tensor_buckets(
 
     current_bucket = []
     current_size = 0
-    for name, tensor in iterable:
+    async for name, tensor in ensure_async_iterator(iterable):
         tensor_size = tensor.element_size() * tensor.numel()
         if current_size + tensor_size > bucket_bytes:
             if current_bucket:
                 yield current_bucket
-            current_bucket = [(name, tensor)]
+            current_bucket = [(name, _compact_for_bucket(tensor))]
             current_size = tensor_size
         else:
-            current_bucket.append((name, tensor))
+            current_bucket.append((name, _compact_for_bucket(tensor)))
             current_size += tensor_size
 
     if current_bucket:

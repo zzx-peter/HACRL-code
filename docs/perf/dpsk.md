@@ -24,7 +24,7 @@ and the megatron backend now has a wider list of models supported:
 ## Getting Started
 
 ### preparation
-The recommended image with pre-built Megatron dependency is `verlai/verl:app-verl0.4-vllm0.8.5-mcore0.13.0-preview`, which is built using the Dockerfile at [docker/verl0.4-cu124-torch2.6-fa2.7.4/Dockerfile.app.vllm.mcore0.13.preview](https://github.com/volcengine/verl/blob/main/docker/verl0.4-cu124-torch2.6-fa2.7.4/Dockerfile.app.vllm.mcore0.13.preview).
+The recommended image with pre-built Megatron dependency is `verlai/verl:app-verl0.4-vllm0.8.5-mcore0.13.0-preview`, which is built using the Dockerfile at [docker/verl0.4-cu124-torch2.6-fa2.7.4/Dockerfile.app.vllm.mcore0.13.preview](https://github.com/verl-project/verl/blob/main/docker/verl0.4-cu124-torch2.6-fa2.7.4/Dockerfile.app.vllm.mcore0.13.preview).
 
 The image is build in Hopper GPUs with DeepEP. It does not support None-Hopper GPUs, such as A100. You may need to reinstall DeepEP to work with A100.
 
@@ -32,7 +32,7 @@ With `OFFLOAD_FRACTION=1`, the system's minimum requirements are lowered. It can
 
 ### DeepSeek 671b
 
-For DeepSeek-V3 671b, please refer to [examples/grpo_trainer/run_deepseek671b_math_megatron_96gb.sh](https://github.com/volcengine/verl/blob/main/examples/grpo_trainer/run_deepseek671b_math_megatron_96gb.sh).
+For DeepSeek-V3 671b, please refer to [examples/grpo_trainer/run_deepseek_v3_671b_megatron.sh](https://github.com/verl-project/verl/blob/main/examples/grpo_trainer/run_deepseek_v3_671b_megatron.sh).
 
 MTP and quantilization is disabled during RL training.
 
@@ -46,7 +46,7 @@ To train your project, configure the following environment variables based on th
 
 ### Qwen3 235b
 
-For Qwen3-235b, please refer to [examples/grpo_trainer/run_qwen3-235b_megatron_96gb.sh](https://github.com/volcengine/verl/blob/main/examples/grpo_trainer/run_qwen3-235b_megatron_96gb.sh).
+For Qwen3-235b, please refer to [examples/grpo_trainer/run_qwen3_235b_a22b_megatron.sh](https://github.com/verl-project/verl/blob/main/examples/grpo_trainer/run_qwen3_235b_a22b_megatron.sh).
 
 To train your project, configure the following environment variables based on the number of available GPUs. These are recommended settings and can be adjusted based on your specific hardware.
 | num gpus | NNODES | TP | PP | EP | OFFLOAD_FRACTION | OFFLOAD_OPTIM | LAST_LAYER |
@@ -59,17 +59,17 @@ To train your project, configure the following environment variables based on th
 ### Benchmark
 Here are some benchmark results for DeepSeek / Qwen3-235B. All configurations match the recommended settings based on the number of GPUs.
 
-| model | num gpus | mean response length | rollout time(s) | GPU memory(GB) | CPU memory(GB) | mfu | step time(s) |
+| model | num gpus | mean response length | rollout time(s) | GPU memory(GB) | CPU memory(GB) | MFU | step time(s) |
 | -- | -- | -- | -- | -- | -- | -- | -- |
 | DeepSeek 671b | 96 | 1960 | 1050 | 66 | 1500 | 0.19 | 1700 |
 
 ### Qwen3-30B-A3B MOE
 
-For Qwen3-30b, please refer to [examples/grpo_trainer/run_qwen3moe-30b_megatron_96gb.sh](https://github.com/volcengine/verl/blob/main/examples/grpo_trainer/run_qwen3moe-30b_megatron_96gb.sh]).
+For Qwen3-30b, please refer to [examples/grpo_trainer/run_qwen3_30b_a3b_megatron.sh](https://github.com/verl-project/verl/blob/main/examples/grpo_trainer/run_qwen3_30b_a3b_megatron.sh).
 
 To train your project, configure the following environment variables based on the number of available GPUs. These are recommended settings and can be adjusted based on your specific hardware.
-| num gpus | NNODES | TP | PP | EP | OFFLOAD_FRACTION | MFU |
-| -- | -- | -- | -- | -- | -- | -- | 
+| num gpus | NNODES | TP | PP | EP | OFFLOAD_FRACTION | OFFLOAD_OPTIM | MFU |
+| -- | -- | -- | -- | -- | -- | -- | -- | 
 | 8 | 1 | 1 | 1 | 8 | 1. | True | 0.4 |
 | 16 | 2 | 1 | 1 | 8 | 1. | True | 0.37 |
 | 32 | 4 | 1 | 1 | 8 | 1. | True | 0.31 |
@@ -82,7 +82,7 @@ The community continue to optimize large MoE models further, ongoing efforts inc
 - optimizing long context RL training performance
 - performance improvement with SGLang x Megatron
 
-We invite the community to try and improve verl together. Get connected with us on [slack](https://join.slack.com/t/verlgroup/shared_invite/zt-2w5p9o4c3-yy0x2Q56s_VlGLsJ93A6vA)/[wechat](https://raw.githubusercontent.com/eric-haibin-lin/verl-community/refs/heads/main/WeChat.JPG)/[Github issues](https://github.com/volcengine/verl/issues/708)!
+We invite the community to try and improve verl together. Get connected with us on [slack](https://join.slack.com/t/verlgroup/shared_invite/zt-2w5p9o4c3-yy0x2Q56s_VlGLsJ93A6vA)/[wechat](https://raw.githubusercontent.com/eric-haibin-lin/verl-community/refs/heads/main/WeChat.JPG)/[Github issues](https://github.com/verl-project/verl/issues/708)!
 
 ## Acknowledgement
 @vermouth1992 @ISEEKYAN @ETOgaosion @yzlnew @ShareLer @BearBiscuit05 @ccclyu @ann-qin-lu @SwordFaith @zzong2006 @zhaochenyang20 @ocss884 @eric-haibin-lin @chenhaiq @techkang

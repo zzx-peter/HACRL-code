@@ -1,145 +1,78 @@
-# Heterogenous Agent Collaborative Reinforcement Learning
+# HACPO on verl V1
 
-## 1.Paper of this work.
+[![arXiv](https://img.shields.io/badge/arXiv-2603.02604-b31b1b.svg?style=flat-square&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2603.02604)
+[![Hugging Face](https://img.shields.io/badge/Hugging%20Face-Paper-FFD21E.svg?style=flat-square&logo=huggingface&logoColor=black)](https://huggingface.co/papers/2603.02604)
 
-All experiments from the paper [*“Heterogenous Agent Collaborative Reinforcement Learning”*](https://arxiv.org/abs/2603.02604) can be reproduced with this repo.
+This branch migrates Heterogeneous Agent Collaborative Policy Optimization (HACPO), introduced in *Heterogeneous Agent Collaborative Reinforcement Learning*, to the verl V1 training engine. It is based on verl commit [`bf48903d`](https://github.com/verl-project/verl/commit/bf48903d93e4618531d3bbae96551a889007dd8b), with the HACPO implementation under [`recipe/hacpo`](recipe/hacpo/README.md).
 
-Heterogenous Agent Collaborative Policy Optimization (HACPO) is an RLVR framework designed to facilitate the collaborative training of multiple heterogeneous agents on a common task.
+The results reported in the paper correspond to the original implementation on the `main` branch. This branch provides the V1 runtime and launch configurations for continued development on newer verl infrastructure.
 
-## 2. Key Contributions
+![Overview of HACPO](recipe/hacpo/figures/overview.png)
 
-|  Feature | What it does |
-| :----------------------------------------: | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Agent-Capability-Aware Advantage Estimation** | Compute distinct intra-group advantage baselines for different agents based on their performance disparities under shared rollouts.|
-| **Model Capabilities Discrepancy Coefficient** | Dynamically modulate the magnitude of mutual learning between agents, functioning similarly to a 'learning rate' based on their divergent capabilities.|
-| **Exponential Importance Sampling** | Employ a gradient-detached exponential importance weight to encourage agents to prioritize learning from responses that exhibit minimal divergence from their own policy distributions.|
-| **Stepwise Clipping** | Apply progressively tightening clip bounds to rollouts from other agents within a batch, ensuring that these external rollouts do not dominate the training process and thereby enhancing overall training stability.|
+*Given the same prompts, heterogeneous policies contribute trajectories to a shared pool. HACPO applies capability- and distribution-aware corrections when updating each policy. Figure from the paper.*
 
-### 3. Quick Start
-#### 3.1 Installation
-This repo use the same environment as verl, so you can find detailed setting on https://verl.readthedocs.io/en/latest/start/install.html.
-#### 3.2 Start
+## Implementation
+
+At each training step, both policies generate responses for the same prompt batch. The verified responses are collected into a tokenizer-neutral trajectory pool, and each policy is updated from the complete pool. Responses produced by the other policy are reconstructed from text with the learner's tokenizer, while their source-policy sequence log-probabilities are retained for the HACPO objective.
+
+The objective implements Agent-Capability-Aware Advantage Estimation, the Model Capabilities Discrepancy Coefficient, Exponential Importance Sampling, and Stepwise Clipping. Each policy keeps an independent model, tokenizer, reference policy, rollout engine, optimizer, and checkpoint state.
+
+The two policy runtimes share one eight-GPU pool. They are activated sequentially, with FSDP state offload and sleeping vLLM replicas used between phases. The current implementation targets synchronous, text-only, single-turn mutual learning between two policies; the runtime is agent-indexed to leave a clean extension point for future multi-agent work.
+
+The main components are:
+
+| Component | Role |
+| --- | --- |
+| [`main_hacpo.py`](recipe/hacpo/main_hacpo.py) | Initializes Ray, the two policy runtimes, and the trainer. |
+| [`hacpo_ray_trainer.py`](recipe/hacpo/hacpo_ray_trainer.py) | Coordinates rollouts, rewards, trajectory exchange, policy updates, validation, and joint checkpoints. |
+| [`hacpo_trajectory.py`](recipe/hacpo/hacpo_trajectory.py) | Builds tokenizer-neutral trajectories and learner-specific training batches. |
+| [`hacpo_workers.py`](recipe/hacpo/hacpo_workers.py) | Connects HACPO to verl V1 training and rollout workers. |
+| [`hacpo_core_algos.py`](recipe/hacpo/hacpo_core_algos.py) | Implements HACPO advantages, importance weighting, and clipping. |
+| [`hacpo_config.py`](recipe/hacpo/hacpo_config.py) | Defines the agent and algorithm configuration. |
+
+See the [recipe README](recipe/hacpo/README.md) for the full data flow and launcher options.
+
+## Installation
+
+Install the vLLM/FSDP environment supported by the pinned verl revision, then install this checkout and the additional trajectory-queue dependency:
+
 ```bash
-bash ./recipe/hacpo/run_qwen3-1.7b_qwen3-4b.sh
-# key parameter
-# aux_model.enable: wether to use multiple heterogenous agents
-# aux_model.path: the path of other heterogenous agent
-# algorithm.adv_estimator: use mapo
-# actor_rollout_ref.actor.policy_loss.loss_mode: use mapo_clip
-# actor_rollout_ref.actor.alpha: expontial importance sampling
-# actor_rollout_ref.actor.accuracy_window_size: the size of batches used to estimate the capability of agent
-# actor_rollout_ref.actor.aux_clip_ratio_low: the low bound for responses from other agents
-# actor_rollout_ref.actor.aux_clip_ratio_step: the step size used in stepwise clipping
+pip install -e .
+pip install TransferQueue==0.1.8
 ```
 
-### 4. Detail of the repo
-#### 4.1 Train two agents together
-`verl/trainer/ppo/ray_trainer.py` 实现了同时训练 **Actor** 和 **Aux** 模型的功能。它通过独立的 Worker Group 管理 Aux 模型，支持为两者配置不同的 Tokenizer，并在数据流中处理 `aux_` 前缀的专用数据（如 `aux_input_ids`），从而在 Ray 框架下实现双模型的高效并行训练。
+The provided presets use eight NVIDIA GPUs, the 7.5k MATH training split, and MATH-500 validation during training. The seven evaluation sets used in the paper are MATH-500, MATH, GSM8K, AIME 2025 (`test16`), AMC 2023, Minerva Math, and OlympiadBench. Data should be converted to verl's `RLHFDataset` parquet format.
 
-```python
-# verl/trainer/ppo/ray_trainer.py
+## Training
 
-# Resource of two models
-# If aux_model is enabled, spawn it as a dedicated WorkerGroup (separate process)
-if self.use_aux_model and ("aux_model" in class_dict):
-    main_class_dict = {k: v for k, v in class_dict.items() if k != "aux_model"}
-    # ... (spawn main worker group) ...
+Set local model and data paths, then launch one of the tested pairs:
 
-    aux_only_dict = {"aux_model": class_dict["aux_model"]}
-    worker_dict_cls_aux = create_colocated_worker_cls(class_dict=aux_only_dict)
-    wg_dict_aux = self.ray_worker_group_cls(
-        resource_pool=resource_pool,
-        ray_cls_with_init=worker_dict_cls_aux,
-        **wg_kwargs,
-    )
-    spawn_wg_aux = wg_dict_aux.spawn(prefix_set=aux_only_dict.keys())
-    all_wg.update(spawn_wg_aux)
+```bash
+export QWEN3_4B_MODEL=/models/Qwen3-4B-Base
+export QWEN3_1P7B_MODEL=/models/Qwen3-1.7B-Base
+export TRAIN_FILE=/data/math/train.parquet
+export VAL_PATHS=/data/math500.parquet
+export CHECKPOINT_DIR=/outputs/hacpo/checkpoints
+export TENSORBOARD_DIR=/outputs/hacpo/tensorboard
 
-# Train of two models
-# if auxiliary model is enabled, also generate rollouts for auxiliary model
-if self.use_aux_model:
-    with marked_timer("gen_aux", timing_raw, color="purple"):
-        if not self.async_rollout_mode:
-            aux_gen_batch_output = self.aux_model_wg.generate_sequences(aux_gen_batch)
-            # mark this is from auxiliary model in the output
-            gen_batch_output.batch["model_source"] = torch.zeros(
-                gen_batch_output.batch.batch_size[0], dtype=torch.long
-            )
-            aux_gen_batch_output.batch["model_source"] = torch.ones(
-                aux_gen_batch_output.batch.batch_size[0], dtype=torch.long
-            )
-
-    # ... (merging batches) ...
-    batch = DataProto.concat([batch, aux_batch])
-
-    # ... (compute old_log_prob for each model) ...
-    old_log_prob_main = self.actor_rollout_wg.compute_log_prob(main_batch)
-    old_log_prob_aux = self.aux_model_wg.compute_log_prob(aux_batch)
-
-    # ... (update actor) ...
-    # use_aux_model update
-    print(f"Updating actor")
-    '''
-    all batch's input_ids, responses, response_mask, attention_mask, position_ids are from chat_template and tokenizer of actor
-    '''
-    aux_mask = batch.batch["model_source"] == 1
-    swap(batch, mask=aux_mask)
-    actor_output = self.actor_rollout_wg.update_actor(batch)
-
-    # ... (update aux model) ...
-    # reverse the model_source to get the auxiliary model data
-    print(f"Updating aux model")
-    '''
-    all batch's input_ids, responses, response_mask, attention_mask, position_ids are from chat_template and tokenizer of aux
-    '''
-    swap(batch)
-    batch.batch["model_source"] = 1 - batch.batch["model_source"]
-    # recompute the advantage, the same method but different in group baseline, kl_penalty
-    # ...
-    aux_output = self.aux_model_wg.update_actor(batch)
+bash recipe/hacpo/run_hacpo_qwen3_4b_qwen3_1p7b_8gpu.sh
 ```
 
-#### 4.2 The Core algorithms
-`verl/trainer/ppo/core_algos.py` 引入了支持双模型的损失计算逻辑（例如 `mapo_clip`）。它利用 `model_source` 标识区分模型来源，为 Actor 计算标准 PPO Loss，为 Aux 模型计算基于性能权重 (`performance`) 的加权 Loss，从而在单次更新中实现对两个模型的联合优化。
+For Qwen3-4B-Base and Llama-3.2-3B-Instruct, also set `LLAMA3P2_3B_MODEL` and run:
 
-```python
-# verl/trainer/ppo/core_algos.py
+```bash
+bash recipe/hacpo/run_hacpo_qwen3_4b_llama3p2_3b_8gpu.sh
+```
 
-# advantage estimator
-@register_adv_est(AdvantageEstimator.MAPO)
-def compute_mapo_outcome_advantage(...):
-    # ...
-    # Update id2score with weighted aux model scores
-    for i in range(bsz):
-        if model_source[i] == 0:  # main model
-            id2score[index[i]].append(scores[i])
-            id2main_score[index[i]].append(scores[i])
-        elif model_source[i] == 1:  # aux model
-            id2score[index[i]].append(scores[i] * aux_model_performance_reciprocal)
-    
-    # Recompute mean and std using the weighted scores
-    for idx in id2score:
-        # ...
-        id2mean[idx] = torch.sum(scores_tensor * weights_tensor) / torch.sum(weights_tensor)
-        # ...
+Both presets use a prompt batch size of 128, eight responses per prompt, a maximum response length of 4096, one actor epoch, greedy MATH-500 validation every three steps, TensorBoard logging, and a final joint checkpoint.
 
-# loss function
-@register_policy_loss("mapo_clip")
-def compute_policy_loss_mapo_clip(...):
-    # ...
-    # Separate main and aux model data
-    main_mask = model_source == 0
-    aux_mask = model_source == 1
-    
-    # ... (compute main model loss) ...
+## Citation
 
-    # Compute loss for aux model (with alpha and performance weighting)
-    if aux_response_mask.numel() > 0:
-        aux_advantages = advantages[aux_mask]
-        aux_seq_importance_ratio = seq_importance_ratio[aux_mask]
-        aux_performance_values = performance[aux_mask].clamp(min=0.1, max=10.0)
-        
-        aux_seq_importance_ratio_clip = torch.clamp(aux_seq_importance_ratio, min=aux_clip_ratio_low + aux_clip_ratio_step * batch_idx, max=1.0)
-        # ...
-        pg_losses[aux_mask] = -aux_advantages * aux_seq_importance_ratio_clip * aux_performance_values.unsqueeze(-1) *(aux_seq_importance_ratio_clip.detach() ** config.alpha)
+```bibtex
+@article{zhang2026hacrl,
+  title   = {Heterogeneous Agent Collaborative Reinforcement Learning},
+  author  = {Zhang, Zhixia and Huang, Zixuan and Li, Gongxun and Wang, Huaiyang and Yuan, Chengyi and Xia, Xin and Wang, Deqing and Zhuang, Fuzhen and Ma, Shuai and Ding, Ning and Yang, Yaodong and Li, Jianxin and Ban, Yikun},
+  journal = {arXiv preprint arXiv:2603.02604},
+  year    = {2026}
+}
 ```

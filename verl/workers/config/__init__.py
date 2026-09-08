@@ -12,12 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .critic import *  # noqa
-from .actor import *  # noqa
-from .engine import *  # noqa
-from .optimizer import *  # noqa
-from .rollout import *  # noqa
-from .model import *  # noqa
-from . import actor, critic, engine, optimizer, rollout, model
+from . import actor, checkpoint, critic, disaggregation, engine, model, optimizer, reward, rollout
+from .actor import *  # noqa: F401
+from .checkpoint import *  # noqa: F401
+from .critic import *  # noqa: F401
+from .disaggregation import *  # noqa: F401
+from .distillation import *  # noqa: F401
+from .engine import *  # noqa: F401
+from .model import *  # noqa: F401
+from .optimizer import *  # noqa: F401
+from .reward import *  # noqa: F401
+from .rollout import *  # noqa: F401
 
-__all__ = actor.__all__ + critic.__all__ + engine.__all__ + optimizer.__all__ + rollout.__all__ + model.__all__
+__all__ = (
+    actor.__all__
+    + critic.__all__
+    + reward.__all__
+    + engine.__all__
+    + optimizer.__all__
+    + rollout.__all__
+    + model.__all__
+    + distillation.__all__
+    + disaggregation.__all__
+    + checkpoint.__all__
+)

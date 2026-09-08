@@ -1,0 +1,8 @@
+# HACPO — pinned verl V1 revision used for implementation and validation
+UPSTREAM=https://github.com/verl-project/verl.git
+VERL_COMMIT=bf48903d93e4618531d3bbae96551a889007dd8b
+VERL_VERSION=0.10.0.dev
+LOCAL_INSTALL=pip install -e .
+EXTRA_DEPENDENCY=TransferQueue==0.1.8
+RECIPE_FOLDER=recipe/hacpo
+NOTES=Uses V1 TrainingWorker custom losses, TransferQueue trajectory exchange, named hybrid rollout replicas, and CheckpointEngineManager.

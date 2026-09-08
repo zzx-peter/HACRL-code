@@ -22,6 +22,13 @@ from typing import Any, Callable, ContextManager
 import numpy as np
 import torch
 import torch.distributed as dist
+
+try:
+    # NPU patch
+    import mindspeed.megatron_adaptor  # noqa: F401
+except ImportError:
+    pass
+
 from accelerate import init_empty_weights
 from megatron.core import mpu
 from megatron.core.models.gpt.gpt_model import ModelType
@@ -34,11 +41,13 @@ from transformers import (
 
 from verl.models.mcore import hf_to_mcore_config
 from verl.utils.device import get_device_name, get_nccl_backend, get_torch_device
+from verl.utils.distributed import set_numa_affinity
 from verl.utils.megatron.dist_checkpointing import load_dist_checkpointing
 from verl.utils.megatron_utils import get_model
 from verl.utils.tokenizer import hf_processor, hf_tokenizer
 
 from .base_model_merger import BaseModelMerger, ModelMergerConfig
+from .output_validation import validate_hf_model_output
 
 
 @contextmanager
@@ -142,6 +151,7 @@ class MegatronModelMerger(BaseModelMerger):
             os.environ["MASTER_ADDR"] = "localhost"
             os.environ["MASTER_PORT"] = "12355"
 
+        set_numa_affinity()
         torch.distributed.init_process_group(get_nccl_backend())
 
         self.rank = torch.distributed.get_rank()
@@ -469,6 +479,7 @@ class MegatronModelMerger(BaseModelMerger):
             print(f"model saved to {target_dir} with {numel=}")
 
             self.model_config.save_pretrained(self.config.target_dir)
+            self.save_generation_config(self.config.target_dir)
 
             processor = hf_processor(self.hf_model_config_path, trust_remote_code=self.config.trust_remote_code)
             tokenizer = hf_tokenizer(self.hf_model_config_path, trust_remote_code=self.config.trust_remote_code)
@@ -479,10 +490,12 @@ class MegatronModelMerger(BaseModelMerger):
                 print(f"Saving tokenizer to {self.config.target_dir}")
                 tokenizer.save_pretrained(self.config.target_dir)
 
-    def merge_and_save(self):
-        from verl.utils.megatron_utils import get_dist_checkpoint_path
+            validate_hf_model_output(self.config.target_dir)
 
-        model_ckpt_path = get_dist_checkpoint_path(self.config.local_dir)
+    def merge_and_save(self):
+        from verl.utils.megatron_utils import get_model_dist_checkpoint_path
+
+        model_ckpt_path = get_model_dist_checkpoint_path(self.config.local_dir)
 
         model_state_dict = self._load_state_dicts(model_ckpt_path)
         merged_state_dict = self._merge_state_dicts(model_state_dict)
@@ -494,7 +507,7 @@ class MegatronModelMerger(BaseModelMerger):
             self._validate_state_dict(merged_state_dict)
         elif self.config.operation == "merge":
             self.save_hf_model_and_tokenizer(merged_state_dict)
-            if self.config.hf_upload:
+            if self.config.hf_upload and self.rank == 0:
                 self.upload_to_huggingface()
         else:
             raise ValueError(f"Unknown operation: {self.config.operation}")

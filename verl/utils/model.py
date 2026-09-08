@@ -15,6 +15,7 @@
 Utilities to create common models from huggingface
 """
 
+import json
 import os
 import re
 import warnings
@@ -23,19 +24,39 @@ from typing import Optional
 
 import numpy as np
 import torch
+from tensordict.tensorclass import NonTensorData
 from torch import nn
 from transformers import (
     AutoConfig,
+    AutoModel,
     AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    AutoModelForTokenClassification,
     GenerationConfig,
     MistralForSequenceClassification,
     PretrainedConfig,
     PreTrainedModel,
 )
+
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    AutoModelForVision2Seq = None
+
+try:
+    from transformers import AutoModelForImageTextToText
+except ImportError:
+    AutoModelForImageTextToText = AutoModelForVision2Seq
+
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from verl.models.registry import ModelRegistry
 from verl.utils.import_utils import is_trl_available
+from verl.utils.transformers_compat import get_auto_model_for_vision2seq
+
+AutoModelForVision2Seq = get_auto_model_for_vision2seq()
+
+_VARLEN_MULTI_MODAL_KEYS = {"input_features", "feature_attention_mask", "mm_token_type_ids"}
 
 
 class LambdaLayer(nn.Module):
@@ -391,7 +412,7 @@ def _get_parallel_model_architecture_from_config(config: PretrainedConfig, value
     )
 
 
-def _load_hf_model(config, model_config, is_value_model, local_cache_path):
+def _load_hf_model(config, model_config, is_value_model):
     """Helper function containing the loading hf model logic"""
     from accelerate import init_empty_weights
     from megatron.core import parallel_state as mpu
@@ -400,15 +421,15 @@ def _load_hf_model(config, model_config, is_value_model, local_cache_path):
 
     assert hasattr(model_config, "architectures"), "architectures cannot be empty when load weight!"
     architectures = getattr(model_config, "architectures", [])
-    local_cache_path = os.path.expanduser(local_cache_path)
+
+    # get auto class
+    auto_cls = get_hf_auto_model_class(model_config)
 
     if config.model.path.startswith("hdfs:"):
         from verl.utils.fs import copy_to_local
 
         print(f"start download from {config.model.path}")
-        local_model_path = copy_to_local(
-            src=config.model.path, cache_dir=local_cache_path, use_shm=config.model.get("use_shm", False)
-        )
+        local_model_path = copy_to_local(src=config.model.path, use_shm=config.model.get("use_shm", False))
         print("finish download")
     else:
         local_model_path = config.model.path
@@ -434,7 +455,7 @@ def _load_hf_model(config, model_config, is_value_model, local_cache_path):
             ]  # workaround, 32001 -> 32000
             is_value_model = True
         else:
-            model = AutoModelForCausalLM.from_pretrained(
+            model = auto_cls.from_pretrained(
                 local_model_path,
                 torch_dtype="auto",
                 # device_map="auto", # disable auto device_map, the HF weight is only loaded to CPU in src_rank
@@ -445,26 +466,19 @@ def _load_hf_model(config, model_config, is_value_model, local_cache_path):
     return architectures, model, state_dict, is_value_model
 
 
-def get_hf_model_path(config, local_cache_path="~/.cache/verl/rlhf"):
-    local_cache_path = os.path.expanduser(local_cache_path)
+def get_hf_model_path(config):
     if config.model.path.startswith("hdfs:"):
         from verl.utils.fs import copy_to_local
 
-        local_model_path = copy_to_local(
-            src=config.model.path, cache_dir=local_cache_path, use_shm=config.model.get("use_shm", False)
-        )
+        local_model_path = copy_to_local(src=config.model.path, use_shm=config.model.get("use_shm", False))
     else:
         local_model_path = config.model.path
     return local_model_path
 
 
-def load_megatron_model_weights(
-    config, model_config, parallel_model, params_dtype, is_value_model=False, local_cache_path="~/.cache/verl/rlhf"
-):
+def load_megatron_model_weights(config, model_config, parallel_model, params_dtype, is_value_model=False):
     """Load weights for verl customized model."""
-    architectures, model, state_dict, is_value_model = _load_hf_model(
-        config, model_config, is_value_model, local_cache_path
-    )
+    architectures, model, state_dict, is_value_model = _load_hf_model(config, model_config, is_value_model)
 
     from verl.models.weight_loader_registry import get_weight_loader
 
@@ -483,11 +497,9 @@ def load_megatron_model_weights(
     return model.config
 
 
-def load_megatron_gptmodel_weights(
-    config, model_config, parallel_model, params_dtype, is_value_model=False, local_cache_path="~/.cache/verl/rlhf"
-):
+def load_megatron_gptmodel_weights(config, model_config, parallel_model, params_dtype, is_value_model=False):
     """Load weights for mcore GPT model."""
-    _, model, state_dict, is_value_model = _load_hf_model(config, model_config, is_value_model, local_cache_path)
+    _, model, state_dict, is_value_model = _load_hf_model(config, model_config, is_value_model)
 
     from verl.models.mcore.loader import load_state_dict_to_megatron_gptmodel
 
@@ -535,7 +547,7 @@ def pad_packed_inputs(unpad_tokens: torch.Tensor, cu_seqlens, max_seqlen_in_batc
     return unpad_tokens, cu_seqlens, max_seqlen_in_batch
 
 
-def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=False):
+def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=False, prefix=""):
     from megatron.core import dist_checkpointing
     from megatron.core.dist_checkpointing.serialization import StrictHandling
 
@@ -544,7 +556,7 @@ def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=Fal
     # strict = StrictHandling.IGNORE_ALL if is_value_model else StrictHandling.ASSUME_OK_UNEXPECTED
     strict = StrictHandling.ASSUME_OK_UNEXPECTED
     for model in parallel_model:
-        ssd = unwrap_model(model).sharded_state_dict()
+        ssd = unwrap_model(model).sharded_state_dict(prefix=prefix)
         if is_value_model:
             for k in list(ssd.keys()):
                 if "output_layer" in k:
@@ -559,6 +571,8 @@ def get_parallel_gptmodel_from_config(
 ):
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
     from megatron.core.models.gpt.gpt_model import GPTModel
+
+    from verl.models.mcore.config_converter import get_hf_rope_theta
 
     use_te = True
     assert tfconfig.normalization == "RMSNorm", "only RMSNorm is supported for now"
@@ -576,16 +590,16 @@ def get_parallel_gptmodel_from_config(
         post_process=post_process,
         share_embeddings_and_output_weights=share_embeddings_and_output_weights,
         position_embedding_type="rope",
-        rotary_base=hf_config.rope_theta,
+        rotary_base=get_hf_rope_theta(hf_config),
         **rope_scaling_args,
     )
     # # for layer in parallel_model.decoder.layers:
     # layer.self_attention.core_attention.flash_attention.softmax_scale = None
     if post_process and value:
-        from verl.models.llama.megatron.layers.parallel_linear import LinearForLastLayer
+        from verl.models.mcore.bridge import LinearForLastLayer
 
         parallel_model.output_layer = LinearForLastLayer(
-            input_size=tfconfig.hidden_size, output_size=1, config=tfconfig
+            input_size=tfconfig.hidden_size, output_size=1, sequence_parallel=tfconfig.sequence_parallel
         )
     return parallel_model
 
@@ -621,7 +635,7 @@ def patch_valuehead_model(model) -> None:
 
 
 def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
-    from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
+    from transformers import AutoModelForCausalLM, AutoModelForTokenClassification
 
     try:
         model = AutoModelForTokenClassification.from_pretrained(
@@ -653,18 +667,23 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
         attn_implementation="flash_attention_2",
         trust_remote_code=trust_remote_code,
     )
+    # vlm models
+    if hasattr(model_config, "text_config"):
+        ori_model.config.hidden_size = model_config.text_config.hidden_size
     model = AutoModelForCausalLMWithValueHead.from_pretrained(ori_model)
     patch_valuehead_model(model)
     return model
 
 
-def get_hf_auto_model_class(hf_config):
-    from transformers import (
-        AutoModel,
-        AutoModelForCausalLM,
-        AutoModelForVision2Seq,
-    )
+_architecture_to_auto_class = {
+    "ForCausalLM": AutoModelForCausalLM,
+    "ForVision2Seq": AutoModelForVision2Seq,
+    "ForTokenClassification": AutoModelForTokenClassification,
+    "ForSequenceClassification": AutoModelForSequenceClassification,
+}
 
+
+def get_hf_auto_model_class(hf_config):
     has_remote_code = hasattr(hf_config, "auto_map") and any(
         hf_config.architectures[0] in val for val in hf_config.auto_map.values()
     )
@@ -675,17 +694,147 @@ def get_hf_auto_model_class(hf_config):
                 actor_module_class = AutoModelForVision2Seq
             case "AutoModelForCausalLM":
                 actor_module_class = AutoModelForCausalLM
+            case "AutoModelForImageTextToText":
+                actor_module_class = AutoModelForImageTextToText
             case _:
                 actor_module_class = AutoModel
     else:
-        if type(hf_config) in AutoModelForVision2Seq._model_mapping.keys():
-            actor_module_class = AutoModelForVision2Seq
-        elif type(hf_config) in AutoModelForCausalLM._model_mapping.keys():
-            actor_module_class = AutoModelForCausalLM
+        actor_module_class = AutoModel
+        # For VLM models, we use type to check instead of architecture
+        if type(hf_config) in AutoModelForImageTextToText._model_mapping.keys():
+            actor_module_class = AutoModelForImageTextToText
         else:
-            actor_module_class = AutoModel
+            for key, cls in _architecture_to_auto_class.items():
+                if key in hf_config.architectures[0]:
+                    actor_module_class = cls
+                    break
 
     return actor_module_class
+
+
+def _pad_last_dim_and_cat(values: list[torch.Tensor], key: str) -> torch.Tensor:
+    if not values:
+        raise ValueError(f"Cannot merge empty multi-modal input list for key {key!r}.")
+
+    def _format_tensor_shapes(values: list[torch.Tensor]) -> str:
+        return ", ".join(str(tuple(value.shape)) for value in values)
+
+    rank = values[0].dim()
+    if rank < 2:
+        raise RuntimeError(
+            f"Cannot pad multi-modal input {key!r} with rank {rank}; shapes: {_format_tensor_shapes(values)}"
+        )
+
+    middle_shape = values[0].shape[1:-1]
+    for value in values:
+        if value.dim() != rank or value.shape[1:-1] != middle_shape:
+            raise RuntimeError(
+                f"Cannot pad multi-modal input {key!r}; expected matching rank and non-batch/non-time "
+                f"dimensions, got shapes: {_format_tensor_shapes(values)}"
+            )
+
+    max_len = max(value.shape[-1] for value in values)
+    if all(value.shape[-1] == max_len for value in values):
+        return torch.cat(values, dim=0)
+
+    padded_values = []
+    for value in values:
+        if value.shape[-1] == max_len:
+            padded_values.append(value)
+            continue
+        padded_value = value.new_zeros((*value.shape[:-1], max_len))
+        padded_value[..., : value.shape[-1]] = value
+        padded_values.append(padded_value)
+
+    return torch.cat(padded_values, dim=0)
+
+
+def extract_multi_modal_inputs(
+    batch_data: list[dict[str, torch.Tensor]],
+    indices: Optional[list[int]] = None,
+) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+    """
+    Extract and process multi-modal inputs from a batch.
+
+    Args:
+        batch_data (list[dict[str, torch.Tensor]]): The batch containing potential multi-modal inputs
+        indices (Optional[list[int]]): If provided, only extract inputs at these indices
+
+    Returns:
+        dict[str, torch.Tensor | list[torch.Tensor]]: Processed multi-modal inputs ready for model consumption
+
+    """
+    multi_modal_inputs = {}
+    multi_modal_inputs_collected = {}
+    has_image_bound = False
+
+    selected_batch_data = batch_data
+    if indices is not None:
+        selected_batch_data = [batch_data[i] for i in indices if i < len(batch_data)]
+
+    for inputs in selected_batch_data:
+        inputs = inputs.data if isinstance(inputs, NonTensorData) else inputs
+        # Mixed pure text and multi-modal dataset.
+        if inputs is None:
+            continue
+        if "image_bound" in inputs:
+            has_image_bound = True
+        for key, value in inputs.items():
+            if value is not None:
+                if key not in multi_modal_inputs_collected:
+                    multi_modal_inputs_collected[key] = []
+                multi_modal_inputs_collected[key].append(value)
+
+    for key, values in multi_modal_inputs_collected.items():
+        if has_image_bound:  # minicpm-o logic
+            multi_modal_inputs[key] = values
+        elif key in _VARLEN_MULTI_MODAL_KEYS:
+            # some multi-modal keys with variable length are put in non-tensor batch,
+            # so we need to pad them manually.
+            multi_modal_inputs[key] = _pad_last_dim_and_cat(values, key)
+        else:
+            try:
+                multi_modal_inputs[key] = torch.cat(values, dim=0)
+            except RuntimeError as e:
+                shapes = ", ".join(str(tuple(value.shape)) for value in values)
+                raise RuntimeError(f"Failed to concatenate multi-modal input {key!r}; shapes: {shapes}") from e
+
+    return multi_modal_inputs
+
+
+def get_lora_rank_from_adapter(adapter_path: str | os.PathLike) -> int:
+    """
+    Extract LoRA rank from adapter configuration file.
+
+    Args:
+        adapter_path: Path to LoRA adapter directory
+
+    Returns:
+        LoRA rank value from adapter_config.json
+
+    Raises:
+        FileNotFoundError: If adapter path or config file doesn't exist
+        ValueError: If config file is invalid or missing rank
+    """
+    adapter_path = os.path.abspath(os.path.expanduser(str(adapter_path)))
+
+    if not os.path.exists(adapter_path):
+        raise FileNotFoundError(f"LoRA adapter path not found: {adapter_path}")
+
+    config_path = os.path.join(adapter_path, "adapter_config.json")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"adapter_config.json not found in {adapter_path}")
+
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+            if "r" not in config:
+                raise ValueError(f"LoRA rank 'r' not found in {config_path}")
+            return int(config["r"])
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in {config_path}: {e}") from e
+    except (KeyError, ValueError) as e:
+        raise ValueError(f"Cannot parse LoRA rank from {config_path}: {e}") from e
 
 
 @dataclass
